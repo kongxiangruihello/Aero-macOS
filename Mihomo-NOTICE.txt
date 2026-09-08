@@ -1,0 +1,20 @@
+Mihomo Core Notice
+==================
+
+This application bundles unmodified Mihomo v1.19.30 executables for macOS.
+
+Project: https://github.com/MetaCubeX/mihomo
+Release: https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.30
+Source:  https://github.com/MetaCubeX/mihomo/tree/v1.19.30
+License: GNU General Public License v3.0
+
+Bundled assets and verified SHA-256 digests:
+
+- mihomo-darwin-arm64-v1.19.30.gz
+  2c7f3a7904fa1cee291e124123e630e7b1ebd13765dd9bf26c0a28432004d9f4
+- mihomo-darwin-amd64-compatible-v1.19.30.gz
+  6e75de0732e8afabe413ff7c235e8f16226ce136672371c60787cbf9607402c5
+
+The executables are started as separate processes and controlled through Mihomo's
+documented loopback REST API. The controller is forced to 127.0.0.1:19097 and is
+protected by a per-installation random secret stored with mode 0600.

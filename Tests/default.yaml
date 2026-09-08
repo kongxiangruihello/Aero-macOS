@@ -1,0 +1,14 @@
+mixed-port: 0
+allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: info
+ipv6: false
+proxies: []
+proxy-groups:
+  - name: 节点选择
+    type: select
+    proxies:
+      - DIRECT
+rules:
+  - MATCH,DIRECT
