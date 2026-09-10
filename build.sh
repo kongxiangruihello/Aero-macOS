@@ -62,6 +62,11 @@ cp -X "${SCRIPT_DIR}/Mihomo-LICENSE.txt" "${RESOURCES_DIR}/Mihomo-LICENSE.txt"
 xattr -cr "${STAGING_APP_DIR}"
 codesign --force --deep --sign - "${STAGING_APP_DIR}" >/dev/null
 ditto -c -k --sequesterRsrc --keepParent "${STAGING_APP_DIR}" "${STAGING_ROOT}/Kong-macOS.zip"
+if [[ -e "${APP_DIR}" ]]; then
+  rm -rf "${APP_DIR}"
+fi
 ditto --norsrc --noextattr --noacl "${STAGING_APP_DIR}" "${APP_DIR}"
+xattr -cr "${APP_DIR}"
+codesign --force --deep --sign - "${APP_DIR}" >/dev/null
 cp -X "${STAGING_ROOT}/Kong-macOS.zip" "${OUTPUT_DIR}/Kong-macOS.zip"
 echo "Built ${APP_DIR}"

@@ -1031,7 +1031,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
     case profiles = "配置"
     case logs = "日志"
     case settings = "设置"
-    case author = "作者"
+    case developer = "开发者"
 
     var id: String { rawValue }
     var icon: String {
@@ -1043,7 +1043,7 @@ enum SidebarSection: String, CaseIterable, Identifiable {
         case .profiles: return "doc.on.doc.fill"
         case .logs: return "terminal.fill"
         case .settings: return "gearshape.fill"
-        case .author: return "person.crop.circle.fill"
+        case .developer: return "person.crop.circle.fill"
         }
     }
 }
@@ -1259,7 +1259,7 @@ struct ContentView: View {
                     case .profiles: ProfilesView()
                     case .logs: LogsView()
                     case .settings: SettingsView()
-                    case .author: AuthorView()
+                    case .developer: DeveloperView()
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -2196,17 +2196,17 @@ struct SettingsView: View {
                                 .font(.system(size: 9)).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)
                         }.padding(.vertical, 12)
                     }
-                    Text("Kong 1.3.12 (Build 152) · Made for macOS").font(.system(size: 10)).foregroundStyle(Theme.secondary).padding(.top, 4)
+                    Text("Kong 1.3.13 (Build 153) · Made for macOS").font(.system(size: 10)).foregroundStyle(Theme.secondary).padding(.top, 4)
                 }.padding(.horizontal, 30).padding(.bottom, 30)
             }
         }
     }
 }
 
-struct AuthorView: View {
+struct DeveloperView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            PageHeader(title: "作者", subtitle: "Kong") { EmptyView() }
+            PageHeader(title: "开发者", subtitle: "Kong") { EmptyView() }
             HStack(spacing: 18) {
                 Image(nsImage: NSApplication.shared.applicationIconImage)
                     .resizable()
