@@ -90,10 +90,12 @@ enum SubscriptionDownloader {
         return request
     }
 
-    static func download(from url: URL, baseConfiguration: URLSessionConfiguration = .default) async throws -> DownloadedSubscription {
+    static func download(from url: URL, preferredUserAgent: String? = nil, baseConfiguration: URLSessionConfiguration = .default) async throws -> DownloadedSubscription {
         var lastForbiddenResponse: (HTTPURLResponse, Data)?
+        let preferred = preferredUserAgent?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let userAgents = preferred.isEmpty ? clientUserAgents : [preferred] + clientUserAgents.filter { $0 != preferred }
 
-        for (index, userAgent) in clientUserAgents.enumerated() {
+        for (index, userAgent) in userAgents.enumerated() {
             let request = makeRequest(url: url, userAgent: userAgent)
             let headers = request.allHTTPHeaderFields ?? [:]
             let configuration = (baseConfiguration.copy() as? URLSessionConfiguration) ?? .default
@@ -116,7 +118,7 @@ enum SubscriptionDownloader {
             guard let http = response as? HTTPURLResponse else { throw SubscriptionDownloadError.invalidResponse }
             if http.statusCode == 403 {
                 lastForbiddenResponse = (http, data)
-                if index < clientUserAgents.count - 1 { continue }
+                if index < userAgents.count - 1 { continue }
                 break
             }
             guard 200..<300 ~= http.statusCode else {
@@ -153,6 +155,6 @@ enum SubscriptionDownloader {
         if ["expired", "invalid token", "token expired", "subscription expired", "订阅已过期", "套餐已过期", "链接失效"].contains(where: body.contains) {
             return "订阅链接已失效或套餐已过期（HTTP 403）。请登录服务商后台重新生成订阅链接"
         }
-        return "订阅服务器拒绝访问（HTTP 403）。已自动尝试 3 种 Clash 客户端身份；请确认套餐和流量有效，并从服务商后台重新复制 Clash / Mihomo 订阅链接"
+        return "订阅服务器拒绝访问（HTTP 403）。已自动尝试多种 Clash 客户端身份；请确认套餐和流量有效，并从服务商后台重新复制 Clash / Mihomo 订阅链接"
     }
 }

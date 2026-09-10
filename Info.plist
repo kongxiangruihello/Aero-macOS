@@ -5,27 +5,27 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
     <key>CFBundleExecutable</key>
-    <string>AeroClash</string>
+    <string>Kong</string>
     <key>CFBundleIdentifier</key>
-    <string>com.aero.networkconsole</string>
+    <string>com.kong.networkconsole</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>Aero</string>
+    <string>Kong</string>
     <key>CFBundleDisplayName</key>
-    <string>Aero</string>
+    <string>Kong</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.1.2</string>
+    <string>1.3.12</string>
     <key>CFBundleVersion</key>
-    <string>122</string>
+    <string>152</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Aero 需要管理员授权来开启和恢复 macOS 系统代理设置。</string>
+    <string>Kong 需要管理员授权来开启和恢复 macOS 系统代理设置。</string>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsArbitraryLoads</key>

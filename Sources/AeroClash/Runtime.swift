@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import Darwin
+import Security
 
 enum CoreState: Equatable {
     case stopped
@@ -45,16 +46,13 @@ final class MihomoProcess: @unchecked Sendable {
         return process?.isRunning == true
     }
 
-    func start(configURL: URL, dataDirectory: URL, secret: String, controllerPort: Int, pidFileURL: URL, onOutput: @escaping @Sendable (String) -> Void, onExit: @escaping @Sendable (Int32) -> Void) throws {
+    func start(executableURL: URL, configURL: URL, dataDirectory: URL, secret: String, controllerPort: Int, pidFileURL: URL, onOutput: @escaping @Sendable (String) -> Void, onExit: @escaping @Sendable (Int32) -> Void) throws {
         stop()
         Self.cleanupStaleProcess(pidFileURL: pidFileURL)
-        guard let executable = Bundle.main.url(forResource: "mihomo", withExtension: nil) else {
-            throw AeroRuntimeError.missingCore
-        }
 
         let process = Process()
         let pipe = Pipe()
-        process.executableURL = executable
+        process.executableURL = executableURL
         process.arguments = [
             "-d", dataDirectory.path,
             "-f", configURL.path,
@@ -110,7 +108,8 @@ final class MihomoProcess: @unchecked Sendable {
         check.waitUntilExit()
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let command = String(data: data, encoding: .utf8) ?? ""
-        guard command.contains("/Aero.app/Contents/Resources/mihomo"), command.contains("Application Support/Aero") else { return }
+        let belongsToApp = command.contains("/Kong.app/Contents/Resources/mihomo") || command.contains("/Aero.app/Contents/Resources/mihomo")
+        guard belongsToApp, command.contains("Application Support/Aero") else { return }
         kill(pid, SIGTERM)
         usleep(180_000)
         if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
@@ -130,7 +129,7 @@ struct MihomoAPI: Sendable {
         guard let url = URL(string: path, relativeTo: baseURL) else { throw AeroRuntimeError.invalidResponse }
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.timeoutInterval = 4
+        request.timeoutInterval = path.hasPrefix("/providers/") ? 30 : 4
         request.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
         if let json {
             request.httpBody = try JSONSerialization.data(withJSONObject: json)
@@ -156,6 +155,99 @@ struct MihomoAPI: Sendable {
             }
         }
         throw lastError ?? AeroRuntimeError.commandFailed("Mihomo 控制器启动超时")
+    }
+}
+
+struct AeroBackupBundle: Codable {
+    let schemaVersion: Int
+    let generatedAt: Date
+    let profiles: [Profile]
+    let runtimeSettings: RuntimeSettings
+    let files: [String: Data]
+}
+
+struct WebDAVClient: Sendable {
+    func upload(_ data: Data, settings: WebDAVSettings, password: String) async throws {
+        var request = try makeRequest(settings: settings, password: password, method: "PUT")
+        request.httpBody = data
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (responseData, response) = try await URLSession.shared.data(for: request)
+        try validate(response: response, data: responseData)
+    }
+
+    func download(settings: WebDAVSettings, password: String) async throws -> Data {
+        let request = try makeRequest(settings: settings, password: password, method: "GET")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validate(response: response, data: data)
+        guard data.count <= 50_000_000 else {
+            throw AeroRuntimeError.commandFailed("WebDAV 备份超过 50 MB")
+        }
+        return data
+    }
+
+    private func makeRequest(settings: WebDAVSettings, password: String, method: String) throws -> URLRequest {
+        let raw = settings.serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let baseURL = URL(string: raw), ["http", "https"].contains(baseURL.scheme?.lowercased() ?? "") else {
+            throw AeroRuntimeError.commandFailed("WebDAV 地址必须使用 HTTP 或 HTTPS")
+        }
+        let path = settings.remotePath.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+        guard !path.isEmpty, !path.split(separator: "/").contains("..") else {
+            throw AeroRuntimeError.commandFailed("WebDAV 远程文件名无效")
+        }
+        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        request.httpMethod = method
+        request.timeoutInterval = 45
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        if !settings.username.isEmpty || !password.isEmpty {
+            let credential = Data("\(settings.username):\(password)".utf8).base64EncodedString()
+            request.setValue("Basic \(credential)", forHTTPHeaderField: "Authorization")
+        }
+        request.setValue("Kong/1.3 WebDAV", forHTTPHeaderField: "User-Agent")
+        return request
+    }
+
+    private func validate(response: URLResponse, data: Data) throws {
+        guard let http = response as? HTTPURLResponse else { throw AeroRuntimeError.invalidResponse }
+        guard 200..<300 ~= http.statusCode else {
+            let detail = String(data: data.prefix(1_000), encoding: .utf8) ?? HTTPURLResponse.localizedString(forStatusCode: http.statusCode)
+            throw AeroRuntimeError.commandFailed("WebDAV 返回 HTTP \(http.statusCode)：\(detail)")
+        }
+    }
+}
+
+final class WebDAVCredentialStore: @unchecked Sendable {
+    private let service = "com.aero.networkconsole.webdav"
+    private let account = "default"
+
+    func loadPassword() -> String {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return "" }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    func savePassword(_ password: String) throws {
+        let key: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(key as CFDictionary)
+        guard !password.isEmpty else { return }
+        var item = key
+        item[kSecValueData as String] = Data(password.utf8)
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        let status = SecItemAdd(item as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw AeroRuntimeError.commandFailed("无法将 WebDAV 密码写入钥匙串（\(status)）")
+        }
     }
 }
 
@@ -186,23 +278,30 @@ struct ProfileRepository: Sendable {
     let root: URL
     let profilesDirectory: URL
     let providersDirectory: URL
+    let backupsDirectory: URL
     let metadataURL: URL
     let secretURL: URL
     let defaultProfileURL: URL
+    let runtimeConfigURL: URL
+    let pacURL: URL
 
     init() {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         root = appSupport.appendingPathComponent("Aero", isDirectory: true)
         profilesDirectory = root.appendingPathComponent("Profiles", isDirectory: true)
         providersDirectory = root.appendingPathComponent("Providers", isDirectory: true)
+        backupsDirectory = root.appendingPathComponent("Backups", isDirectory: true)
         metadataURL = root.appendingPathComponent("profiles.json")
         secretURL = root.appendingPathComponent("controller.secret")
         defaultProfileURL = profilesDirectory.appendingPathComponent("default.yaml")
+        runtimeConfigURL = root.appendingPathComponent("runtime.yaml")
+        pacURL = root.appendingPathComponent("aero.pac")
     }
 
     func prepare() throws {
         try FileManager.default.createDirectory(at: profilesDirectory, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: providersDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: backupsDirectory, withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: defaultProfileURL.path) {
             try Self.defaultConfig.write(to: defaultProfileURL, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: defaultProfileURL.path)
@@ -238,11 +337,126 @@ struct ProfileRepository: Sendable {
         profilesDirectory.appendingPathComponent(profile.fileName)
     }
 
-    func validate(configURL: URL, coreURL: URL) throws {
+    func prepareRuntimeConfig(for profile: Profile, settings: RuntimeSettings, tunEnabled: Bool, coreURL: URL) throws -> URL {
+        let base = try Data(contentsOf: fileURL(for: profile))
+        let rendered = try RuntimeConfigOverlay.render(baseData: base, settings: settings, tunEnabled: tunEnabled)
+        try rendered.write(to: runtimeConfigURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: runtimeConfigURL.path)
+        try validate(configURL: runtimeConfigURL, coreURL: coreURL)
+        return runtimeConfigURL
+    }
+
+    func writePAC(httpPort: Int, socksPort: Int) throws -> URL {
+        let script = """
+        function FindProxyForURL(url, host) {
+          if (isPlainHostName(host) || dnsDomainIs(host, ".local") ||
+              isInNet(host, "127.0.0.0", "255.0.0.0") ||
+              isInNet(host, "10.0.0.0", "255.0.0.0") ||
+              isInNet(host, "172.16.0.0", "255.240.0.0") ||
+              isInNet(host, "192.168.0.0", "255.255.0.0")) return "DIRECT";
+          return "PROXY 127.0.0.1:\(httpPort); SOCKS5 127.0.0.1:\(socksPort); DIRECT";
+        }
+        """
+        try script.write(to: pacURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: pacURL.path)
+        return pacURL
+    }
+
+    func backup(_ profile: Profile) throws {
+        let source = fileURL(for: profile)
+        guard FileManager.default.fileExists(atPath: source.path) else { return }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let prefix = "\(profile.id)-"
+        let destination = backupsDirectory.appendingPathComponent("\(prefix)\(formatter.string(from: Date()))-\(UUID().uuidString.prefix(6)).yaml")
+        try FileManager.default.copyItem(at: source, to: destination)
+        let backups = (try? FileManager.default.contentsOfDirectory(at: backupsDirectory, includingPropertiesForKeys: [.contentModificationDateKey]))?
+            .filter { $0.lastPathComponent.hasPrefix(prefix) }
+            .sorted { lhs, rhs in
+                let left = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let right = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return left > right
+            } ?? []
+        for expired in backups.dropFirst(5) { try? FileManager.default.removeItem(at: expired) }
+    }
+
+    func makeBackupBundle(profiles: [Profile], settings: RuntimeSettings) throws -> AeroBackupBundle {
+        var files: [String: Data] = [:]
+        for profile in profiles {
+            guard isSafeFileName(profile.fileName) else {
+                throw AeroRuntimeError.commandFailed("配置文件名不安全：\(profile.fileName)")
+            }
+            files["Profiles/\(profile.fileName)"] = try Data(contentsOf: fileURL(for: profile))
+            if let payload = profile.payloadFileName {
+                guard isSafeFileName(payload) else {
+                    throw AeroRuntimeError.commandFailed("Provider 文件名不安全：\(payload)")
+                }
+                let providerURL = providersDirectory.appendingPathComponent(payload)
+                if FileManager.default.fileExists(atPath: providerURL.path) {
+                    files["Providers/\(payload)"] = try Data(contentsOf: providerURL)
+                }
+            }
+        }
+        let providerFiles = (try? FileManager.default.contentsOfDirectory(at: providersDirectory, includingPropertiesForKeys: [.isRegularFileKey])) ?? []
+        for providerURL in providerFiles where isSafeFileName(providerURL.lastPathComponent) {
+            let values = try? providerURL.resourceValues(forKeys: [.isRegularFileKey])
+            if values?.isRegularFile == true {
+                files["Providers/\(providerURL.lastPathComponent)"] = try Data(contentsOf: providerURL)
+            }
+        }
+        return AeroBackupBundle(schemaVersion: 1, generatedAt: Date(), profiles: profiles, runtimeSettings: settings, files: files)
+    }
+
+    func restoreBackup(_ bundle: AeroBackupBundle, coreURL: URL) throws -> ([Profile], RuntimeSettings) {
+        guard bundle.schemaVersion == 1, !bundle.profiles.isEmpty else {
+            throw AeroRuntimeError.commandFailed("WebDAV 备份格式或版本不受支持")
+        }
+        let staging = root.appendingPathComponent("Restore-\(UUID().uuidString)", isDirectory: true)
+        let stagingProfiles = staging.appendingPathComponent("Profiles", isDirectory: true)
+        let stagingProviders = staging.appendingPathComponent("Providers", isDirectory: true)
+        try FileManager.default.createDirectory(at: stagingProfiles, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: stagingProviders, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: staging) }
+
+        for profile in bundle.profiles {
+            guard isSafeFileName(profile.fileName),
+                  let data = bundle.files["Profiles/\(profile.fileName)"] else {
+                throw AeroRuntimeError.commandFailed("备份缺少配置文件：\(profile.name)")
+            }
+            try data.write(to: stagingProfiles.appendingPathComponent(profile.fileName), options: .atomic)
+            if let payload = profile.payloadFileName {
+                guard isSafeFileName(payload), let providerData = bundle.files["Providers/\(payload)"] else {
+                    throw AeroRuntimeError.commandFailed("备份缺少 Provider：\(payload)")
+                }
+                try providerData.write(to: stagingProviders.appendingPathComponent(payload), options: .atomic)
+            }
+        }
+        for profile in bundle.profiles {
+            try validate(configURL: stagingProfiles.appendingPathComponent(profile.fileName), coreURL: coreURL, dataDirectory: staging)
+        }
+
+        for existing in loadProfiles() { try? backup(existing) }
+        for (relativePath, data) in bundle.files {
+            let components = relativePath.split(separator: "/").map(String.init)
+            guard components.count == 2,
+                  ["Profiles", "Providers"].contains(components[0]),
+                  isSafeFileName(components[1]) else {
+                throw AeroRuntimeError.commandFailed("备份包含不安全的文件路径")
+            }
+            let directory = components[0] == "Profiles" ? profilesDirectory : providersDirectory
+            let destination = directory.appendingPathComponent(components[1])
+            try data.write(to: destination, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+        }
+        try saveProfiles(bundle.profiles)
+        return (bundle.profiles, bundle.runtimeSettings)
+    }
+
+    func validate(configURL: URL, coreURL: URL, dataDirectory: URL? = nil) throws {
         let task = Process()
         let pipe = Pipe()
         task.executableURL = coreURL
-        task.arguments = ["-t", "-d", root.path, "-f", configURL.path, "-ext-ctl", "127.0.0.1:0"]
+        task.arguments = ["-t", "-d", (dataDirectory ?? root).path, "-f", configURL.path, "-ext-ctl", "127.0.0.1:0"]
         task.standardOutput = pipe
         task.standardError = pipe
         try task.run()
@@ -252,6 +466,10 @@ struct ProfileRepository: Sendable {
             let detail = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "配置校验失败"
             throw AeroRuntimeError.commandFailed(detail)
         }
+    }
+
+    private func isSafeFileName(_ value: String) -> Bool {
+        !value.isEmpty && value == URL(fileURLWithPath: value).lastPathComponent && value != "." && value != ".."
     }
 
     static let defaultProfile = Profile(
@@ -350,6 +568,53 @@ final class SystemProxyManager: @unchecked Sendable {
             }
             throw error
         }
+    }
+
+    func enablePAC(url: URL) throws {
+        if !hasActiveSnapshot {
+            let snapshot = try captureSnapshot()
+            let data = try JSONEncoder().encode(snapshot)
+            try data.write(to: snapshotURL, options: .atomic)
+        }
+        let snapshot = try loadSnapshot()
+        var commands: [String] = []
+        for entry in snapshot.entries {
+            let service = shellQuote(entry.service)
+            commands += [
+                "\(command) -setwebproxystate \(service) off",
+                "\(command) -setsecurewebproxystate \(service) off",
+                "\(command) -setsocksfirewallproxystate \(service) off",
+                "\(command) -setautoproxyurl \(service) \(shellQuote(url.absoluteString))",
+                "\(command) -setautoproxystate \(service) on"
+            ]
+        }
+        do {
+            try runPrivilegedBatch(commands)
+        } catch {
+            if (try? runPrivilegedBatch(restoreCommands(for: snapshot))) != nil {
+                try? FileManager.default.removeItem(at: snapshotURL)
+            }
+            throw error
+        }
+    }
+
+    func status(httpPort: Int, socksPort: Int, pacURL: URL) -> ProxyCaptureMode? {
+        guard let output = try? run(["-listallnetworkservices"]) else { return nil }
+        let services = output.split(whereSeparator: \.isNewline).dropFirst().map(String.init).filter { !$0.hasPrefix("*") && !$0.isEmpty }
+        for service in services {
+            if let auto = try? run(["-getautoproxyurl", service]),
+               parseAutoProxy(auto).enabled,
+               parseAutoProxy(auto).url == pacURL.absoluteString { return .pac }
+            if let web = try? run(["-getwebproxy", service]),
+               let socks = try? run(["-getsocksfirewallproxy", service]) {
+                let webValue = parseProxy(web)
+                let socksValue = parseProxy(socks)
+                if webValue.enabled, socksValue.enabled,
+                   webValue.server == "127.0.0.1", socksValue.server == "127.0.0.1",
+                   webValue.port == httpPort, socksValue.port == socksPort { return .system }
+            }
+        }
+        return nil
     }
 
     func disable() throws {

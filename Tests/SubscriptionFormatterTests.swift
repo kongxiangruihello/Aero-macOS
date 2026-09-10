@@ -86,6 +86,7 @@ struct SubscriptionFormatterTests {
             password: test
         """
         let rawURI = "ss://YWVzLTEyOC1nY206dGVzdA@127.0.0.1:8388#Local%20SS"
+        let rawHysteria = "hysteria://test@127.0.0.1:8443?protocol=udp&upmbps=20&downmbps=100#Local%20Hysteria"
         let encoded = Data(rawURI.utf8).base64EncodedString()
         let ssrPassword = Data("test".utf8).base64EncodedString()
         let ssrName = Data("Local SSR".utf8).base64EncodedString()
@@ -96,6 +97,7 @@ struct SubscriptionFormatterTests {
             ("full", Data(full.utf8), "Clash/Mihomo 配置"),
             ("provider", Data(provider.utf8), "代理提供者订阅"),
             ("uri", Data(rawURI.utf8), "节点链接订阅"),
+            ("hysteria", Data(rawHysteria.utf8), "节点链接订阅"),
             ("base64", Data(encoded.utf8), "节点链接订阅"),
             ("ssr", Data(rawSSR.utf8), "节点链接订阅")
         ]

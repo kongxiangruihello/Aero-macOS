@@ -23,7 +23,7 @@ enum SubscriptionFormatError: LocalizedError {
 }
 
 enum SubscriptionFormatter {
-    private static let supportedSchemes = ["ss://", "ssr://", "trojan://", "vless://", "vmess://", "hysteria2://", "hy2://", "tuic://"]
+    private static let supportedSchemes = ["ss://", "ssr://", "trojan://", "vless://", "vmess://", "hysteria://", "hysteria2://", "hy2://", "tuic://"]
 
     static func prepare(data: Data, id: String) throws -> PreparedSubscription {
         guard !data.isEmpty else { throw SubscriptionFormatError.empty }
@@ -94,13 +94,13 @@ enum SubscriptionFormatter {
             "log-level": "info",
             "ipv6": false,
             "proxy-providers": [
-                "Aero Subscription": [
+                "Kong Subscription": [
                     "type": "file",
                     "path": "./Providers/\(providerFileName)",
                     "health-check": ["enable": true, "url": "https://www.gstatic.com/generate_204", "interval": 600]
                 ]
             ],
-            "proxy-groups": [["name": "节点选择", "type": "select", "use": ["Aero Subscription"]]],
+            "proxy-groups": [["name": "节点选择", "type": "select", "use": ["Kong Subscription"]]],
             "rules": ["MATCH,节点选择"]
         ]
         return try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
@@ -150,6 +150,7 @@ enum SubscriptionFormatter {
         case "trojan": return parseTrojan(line)
         case "vless": return parseVLESS(line)
         case "vmess": return parseVMess(line)
+        case "hysteria": return parseHysteria(line)
         case "hysteria2", "hy2": return parseHysteria2(line)
         case "tuic": return parseTUIC(line)
         default: return nil
@@ -201,6 +202,24 @@ enum SubscriptionFormatter {
             proxy["obfs"] = obfs
             proxy["obfs-password"] = query["obfs-password"] ?? query["obfsPassword"] ?? ""
         }
+        applyCommonOptions(query: query, to: &proxy)
+        return proxy
+    }
+
+    private static func parseHysteria(_ value: String) -> [String: Any]? {
+        guard let components = URLComponents(string: value), let host = components.host, let port = components.port else { return nil }
+        let query = queryMap(components)
+        let authentication = nonEmpty(components.user) ?? nonEmpty(query["auth"]) ?? nonEmpty(query["auth-str"])
+        guard let authentication else { return nil }
+        var proxy: [String: Any] = baseProxy(type: "hysteria", components: components, server: host, port: port)
+        proxy["auth-str"] = authentication
+        proxy["protocol"] = query["protocol"] ?? "udp"
+        proxy["up"] = query["upmbps"] ?? query["up"] ?? "30"
+        proxy["down"] = query["downmbps"] ?? query["down"] ?? "200"
+        proxy["sni"] = query["peer"] ?? query["sni"] ?? host
+        proxy["skip-cert-verify"] = boolValue(query["insecure"])
+        if let obfs = nonEmpty(query["obfs"]) { proxy["obfs"] = obfs }
+        applyCommonOptions(query: query, to: &proxy)
         return proxy
     }
 
@@ -214,6 +233,7 @@ enum SubscriptionFormatter {
         proxy["skip-cert-verify"] = boolValue(query["allow_insecure"] ?? query["insecure"])
         proxy["congestion-controller"] = query["congestion_control"] ?? "bbr"
         proxy["udp-relay-mode"] = query["udp_relay_mode"] ?? "native"
+        applyCommonOptions(query: query, to: &proxy)
         return proxy
     }
 
@@ -307,6 +327,18 @@ enum SubscriptionFormatter {
             proxy["ws-opts"] = ["path": query["path"]?.removingPercentEncoding ?? "/", "headers": headers]
         } else if network == "grpc" {
             proxy["grpc-opts"] = ["grpc-service-name": query["serviceName"] ?? query["service-name"] ?? ""]
+        }
+        applyCommonOptions(query: query, to: &proxy)
+    }
+
+    private static func applyCommonOptions(query: [String: String], to proxy: inout [String: Any]) {
+        if let dialer = nonEmpty(query["dialer-proxy"] ?? query["dialerProxy"]) { proxy["dialer-proxy"] = dialer }
+        if boolValue(query["mux"] ?? query["smux"]) {
+            proxy["smux"] = [
+                "enabled": true,
+                "protocol": nonEmpty(query["mux-protocol"] ?? query["smux-protocol"]) ?? "h2mux",
+                "only-tcp": true
+            ]
         }
     }
 
