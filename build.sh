@@ -11,7 +11,7 @@ CONTENTS_DIR="${STAGING_APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 MODULE_CACHE_DIR="${SCRIPT_DIR}/.build/ModuleCache"
-SDK_PATH="/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk"
+SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
 
 if [[ ! -x "${SCRIPT_DIR}/.downloads/mihomo-arm64" || ! -x "${SCRIPT_DIR}/.downloads/mihomo-amd64" ]]; then
   "${SCRIPT_DIR}/download-core.sh"

@@ -1,8 +1,13 @@
 import SwiftUI
 import AppKit
+import Combine
 import UniformTypeIdentifiers
 import ServiceManagement
 import CoreImage.CIFilterBuiltins
+
+// Keep source-compatible property-wrapper state when building with Command Line Tools
+// whose SDK exposes the newer SwiftUI @State macro without bundling its compiler plug-in.
+typealias StoredState<Value> = SwiftUI.State<Value>
 
 // MARK: - App model
 
@@ -56,6 +61,7 @@ final class AppModel: NSObject, ObservableObject {
     @Published var showYAMLEditor = false
     @Published var editingYAML = ""
     @Published var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published var showMenuBarRates = UserDefaults.standard.object(forKey: "showMenuBarRates") as? Bool ?? true
     @Published var coreStartedAt: Date?
     @Published var webDAVSettings: WebDAVSettings
     @Published var webDAVPassword: String
@@ -402,6 +408,44 @@ final class AppModel: NSObject, ObservableObject {
         } catch {
             launchAtLogin = SMAppService.mainApp.status == .enabled
             presentError("开机启动设置失败", error)
+        }
+    }
+
+    func setShowMenuBarRates(_ enabled: Bool) {
+        showMenuBarRates = enabled
+        UserDefaults.standard.set(enabled, forKey: "showMenuBarRates")
+        showToast(enabled ? "已显示菜单栏实时速率" : "已隐藏菜单栏实时速率")
+    }
+
+    func setAllowLAN(_ enabled: Bool) {
+        guard runtimeSettings.allowLAN != enabled else { return }
+        runtimeSettings.allowLAN = enabled
+        saveAndApplySettings()
+    }
+
+    func copyTerminalProxyCommand() {
+        let command = "export http_proxy=http://127.0.0.1:\(httpPort) https_proxy=http://127.0.0.1:\(httpPort) all_proxy=socks5://127.0.0.1:\(socksPort)"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(command, forType: .string)
+        showToast("终端代理命令已复制")
+    }
+
+    func selectNode(named nodeName: String, in groupName: String) {
+        let previousGroup = selectedProxyGroup
+        let previousNode = selectedNodeID
+        selectedProxyGroup = groupName
+        selectedNodeID = nodeName
+        Task {
+            do {
+                let group = groupName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? groupName
+                _ = try await api.request("/proxies/\(group)", method: "PUT", json: ["name": nodeName])
+                showToast("\(groupName) 已切换至 \(nodeName)")
+                await refreshProxies()
+            } catch {
+                selectedProxyGroup = previousGroup
+                selectedNodeID = previousNode
+                showToast("节点切换失败：\(error.localizedDescription)")
+            }
         }
     }
 
@@ -1200,8 +1244,425 @@ extension View {
 
 // MARK: - App
 
+@MainActor
+final class KongApplicationDelegate: NSObject, NSApplicationDelegate {
+    private var statusBarController: StatusBarController?
+
+    func installStatusBar(for model: AppModel) {
+        guard statusBarController == nil else { return }
+        statusBarController = StatusBarController(model: model)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        statusBarController?.showMainWindow()
+        return true
+    }
+}
+
+@MainActor
+final class StatusBarController: NSObject {
+    private let model: AppModel
+    private let statusItem: NSStatusItem
+    private let popover = NSPopover()
+    private let contextPopover = NSPopover()
+    private var cancellables = Set<AnyCancellable>()
+    private var mainWindow: NSWindow?
+
+    init(model: AppModel) {
+        self.model = model
+        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        super.init()
+
+        popover.behavior = .transient
+        popover.animates = true
+        popover.contentSize = NSSize(width: 270, height: 205)
+        popover.contentViewController = NSHostingController(
+            rootView: MenuBarContent()
+                .environmentObject(model)
+                .preferredColorScheme(.light)
+        )
+        contextPopover.behavior = .transient
+        contextPopover.animates = true
+        contextPopover.contentSize = NSSize(width: 340, height: 590)
+        contextPopover.contentViewController = NSHostingController(
+            rootView: TrayContextMenuView(
+                openSection: { [weak self] section in self?.showMainWindow(section: section) },
+                dismiss: { [weak self] in self?.contextPopover.performClose(nil) },
+                quit: { [weak self] in
+                    self?.contextPopover.performClose(nil)
+                    NSApp.terminate(nil)
+                }
+            )
+            .environmentObject(model)
+            .preferredColorScheme(.light)
+        )
+
+        if let button = statusItem.button {
+            button.target = self
+            button.action = #selector(statusItemClicked(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.imagePosition = .imageLeft
+            button.imageScaling = .scaleProportionallyDown
+            button.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .light)
+            button.toolTip = "Kong · 左键打开，右键显示快捷菜单"
+        }
+
+        model.$uploadRate
+            .combineLatest(model.$downloadRate, model.$showMenuBarRates)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _, _, _ in self?.updateStatusItem() }
+            .store(in: &cancellables)
+        updateStatusItem()
+        DispatchQueue.main.async { [weak self] in
+            self?.mainWindow = NSApp.windows.first(where: { !($0 is NSPanel) && $0.canBecomeKey })
+        }
+    }
+
+    deinit {
+        NSStatusBar.system.removeStatusItem(statusItem)
+    }
+
+    private func updateStatusItem() {
+        guard let button = statusItem.button else { return }
+        button.image = model.menuBarIcon
+        button.image?.size = NSSize(width: 20, height: 20)
+        button.title = model.showMenuBarRates
+            ? "↓\(model.menuBarDownloadRateText) ↑\(model.menuBarUploadRateText)"
+            : ""
+    }
+
+    @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            popover.performClose(nil)
+            if contextPopover.isShown {
+                contextPopover.performClose(nil)
+            } else {
+                contextPopover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+                contextPopover.contentViewController?.view.window?.makeKey()
+            }
+        } else if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            contextPopover.performClose(nil)
+            popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
+        }
+    }
+
+    func showMainWindow(section: SidebarSection? = nil) {
+        if let section { model.selectedSection = section }
+        popover.performClose(nil)
+        contextPopover.performClose(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        if mainWindow == nil {
+            mainWindow = NSApp.windows.first(where: { !($0 is NSPanel) && $0.canBecomeKey })
+        }
+        mainWindow?.makeKeyAndOrderFront(nil)
+    }
+}
+
+struct TrayContextMenuView: View {
+    @EnvironmentObject var model: AppModel
+    let openSection: (SidebarSection) -> Void
+    let dismiss: () -> Void
+    let quit: () -> Void
+
+    @StoredState private var modeExpanded = false
+    @StoredState private var expandedProxyGroup: String?
+    @StoredState private var profilesExpanded = false
+    @StoredState private var helpExpanded = false
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                header
+                TrayMenuDivider()
+
+                Button { modeExpanded.toggle() } label: {
+                    TrayMenuRow(
+                        title: "出站模式（\(model.mode.rawValue)）",
+                        symbol: "point.3.filled.connected.trianglepath.dotted",
+                        showsChevron: true,
+                        expanded: modeExpanded
+                    )
+                }
+                .buttonStyle(TrayMenuButtonStyle())
+
+                if modeExpanded {
+                    ForEach(ProxyMode.allCases) { mode in
+                        Button {
+                            model.setMode(mode)
+                            dismiss()
+                        } label: {
+                            TrayMenuRow(title: mode.rawValue, checked: model.mode == mode, indented: true)
+                        }
+                        .buttonStyle(TrayMenuButtonStyle())
+                    }
+                }
+
+                if model.proxyGroups.isEmpty {
+                    TrayMenuRow(title: "暂无可用代理组", symbol: "network.slash", disabled: true)
+                } else {
+                    ForEach(model.proxyGroups) { group in
+                        Button {
+                            expandedProxyGroup = expandedProxyGroup == group.name ? nil : group.name
+                        } label: {
+                            TrayMenuRow(
+                                title: group.name,
+                                detail: group.now,
+                                symbol: "server.rack",
+                                showsChevron: true,
+                                expanded: expandedProxyGroup == group.name
+                            )
+                        }
+                        .buttonStyle(TrayMenuButtonStyle())
+
+                        if expandedProxyGroup == group.name {
+                            ForEach(group.members, id: \.self) { member in
+                                Button {
+                                    model.selectNode(named: member, in: group.name)
+                                    dismiss()
+                                } label: {
+                                    TrayMenuRow(title: member, checked: group.now == member, indented: true)
+                                }
+                                .buttonStyle(TrayMenuButtonStyle())
+                            }
+                        }
+                    }
+                }
+
+                TrayMenuDivider()
+
+                Button {
+                    model.toggleConnection()
+                    dismiss()
+                } label: {
+                    TrayMenuRow(
+                        title: "设置为系统代理",
+                        shortcut: "⌘S",
+                        checked: model.isConnected,
+                        symbol: model.isConnected ? nil : "power"
+                    )
+                }
+                .buttonStyle(TrayMenuButtonStyle())
+
+                Button {
+                    model.copyTerminalProxyCommand()
+                    dismiss()
+                } label: {
+                    TrayMenuRow(title: "复制终端代理命令", shortcut: "⌘C", symbol: "terminal")
+                }
+                .buttonStyle(TrayMenuButtonStyle())
+
+                TrayMenuDivider()
+
+                Button {
+                    model.setLaunchAtLogin(!model.launchAtLogin)
+                    dismiss()
+                } label: {
+                    TrayMenuRow(title: "开机启动", checked: model.launchAtLogin, symbol: model.launchAtLogin ? nil : "power.circle")
+                }
+                .buttonStyle(TrayMenuButtonStyle())
+
+                Button {
+                    model.setShowMenuBarRates(!model.showMenuBarRates)
+                    dismiss()
+                } label: {
+                    TrayMenuRow(title: "显示实时速率", checked: model.showMenuBarRates, symbol: model.showMenuBarRates ? nil : "speedometer")
+                }
+                .buttonStyle(TrayMenuButtonStyle())
+
+                Button {
+                    model.setAllowLAN(!model.runtimeSettings.allowLAN)
+                    dismiss()
+                } label: {
+                    TrayMenuRow(title: "允许局域网连接", checked: model.runtimeSettings.allowLAN, symbol: model.runtimeSettings.allowLAN ? nil : "wifi.router")
+                }
+                .buttonStyle(TrayMenuButtonStyle())
+
+                TrayMenuDivider()
+
+                Button {
+                    model.testLatency()
+                    dismiss()
+                } label: {
+                    TrayMenuRow(
+                        title: model.latencyTesting ? "正在测速…" : "延迟测速",
+                        shortcut: "⌘T",
+                        symbol: "scope",
+                        disabled: model.coreState != .running || model.latencyTesting
+                    )
+                }
+                .buttonStyle(TrayMenuButtonStyle())
+                .disabled(model.coreState != .running || model.latencyTesting)
+
+                Button { openSection(.overview) } label: {
+                    TrayMenuRow(title: "控制台", shortcut: "⌘D", symbol: "rectangle.3.group")
+                }
+                .buttonStyle(TrayMenuButtonStyle())
+
+                Button { openSection(.connections) } label: {
+                    TrayMenuRow(title: "连接查看器", shortcut: "⇧⌘D", symbol: "arrow.triangle.branch")
+                }
+                .buttonStyle(TrayMenuButtonStyle())
+
+                TrayMenuDivider()
+
+                Button { profilesExpanded.toggle() } label: {
+                    TrayMenuRow(title: "配置", symbol: "doc.on.doc", showsChevron: true, expanded: profilesExpanded)
+                }
+                .buttonStyle(TrayMenuButtonStyle())
+
+                if profilesExpanded {
+                    ForEach(model.profiles) { profile in
+                        Button {
+                            model.activateProfile(profile)
+                            dismiss()
+                        } label: {
+                            TrayMenuRow(title: profile.name, checked: profile.id == model.activeProfileID, indented: true)
+                        }
+                        .buttonStyle(TrayMenuButtonStyle())
+                    }
+                }
+
+                Button { openSection(.settings) } label: {
+                    TrayMenuRow(title: "更多设置", symbol: "gearshape")
+                }
+                .buttonStyle(TrayMenuButtonStyle())
+
+                Button { helpExpanded.toggle() } label: {
+                    TrayMenuRow(title: "帮助", symbol: "questionmark.circle", showsChevron: true, expanded: helpExpanded)
+                }
+                .buttonStyle(TrayMenuButtonStyle())
+
+                if helpExpanded {
+                    Button { openSection(.developer) } label: {
+                        TrayMenuRow(title: "关于 Kong", symbol: "info.circle", indented: true)
+                    }
+                    .buttonStyle(TrayMenuButtonStyle())
+                }
+
+                TrayMenuDivider()
+
+                Button(action: quit) {
+                    TrayMenuRow(title: "退出 Kong", shortcut: "⌘Q", symbol: "power")
+                }
+                .buttonStyle(TrayMenuButtonStyle())
+            }
+            .padding(8)
+        }
+        .frame(width: 340, height: 590)
+        .background(Theme.bg)
+    }
+
+    private var header: some View {
+        HStack(spacing: 11) {
+            Image(nsImage: NSApplication.shared.applicationIconImage)
+                .resizable()
+                .scaledToFit()
+                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .frame(width: 30, height: 30)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Kong")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(Theme.text)
+                Text(model.isConnected ? "\(model.runtimeSettings.captureMode.rawValue)已开启" : "流量接管已关闭")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.secondary)
+            }
+            Spacer()
+            Text("↓\(model.menuBarDownloadRateText)  ↑\(model.menuBarUploadRateText)")
+                .font(.system(size: 10, weight: .regular, design: .monospaced))
+                .foregroundStyle(Theme.secondary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 48)
+    }
+}
+
+private struct TrayMenuRow: View {
+    let title: String
+    var detail: String? = nil
+    var shortcut: String? = nil
+    var checked = false
+    var symbol: String? = nil
+    var showsChevron = false
+    var expanded = false
+    var indented = false
+    var disabled = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Group {
+                if checked {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(Theme.accent)
+                } else if let symbol {
+                    Image(systemName: symbol)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Theme.secondary)
+                } else {
+                    Color.clear
+                }
+            }
+            .frame(width: 18, height: 18)
+
+            Text(title)
+                .font(.system(size: 13, weight: .regular))
+                .foregroundStyle(Theme.text)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            if let detail {
+                Text(detail)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.secondary)
+                    .lineLimit(1)
+                    .frame(maxWidth: 142, alignment: .trailing)
+            }
+            if let shortcut {
+                Text(shortcut)
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle(Theme.secondary.opacity(0.78))
+            }
+            if showsChevron {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Theme.secondary)
+                    .rotationEffect(.degrees(expanded ? 90 : 0))
+            }
+        }
+        .padding(.leading, indented ? 18 : 8)
+        .padding(.trailing, 8)
+        .frame(height: 34)
+        .opacity(disabled ? 0.45 : 1)
+        .contentShape(Rectangle())
+    }
+}
+
+private struct TrayMenuDivider: View {
+    var body: some View {
+        Rectangle()
+            .fill(Theme.stroke.opacity(0.72))
+            .frame(height: 1)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+    }
+}
+
+private struct TrayMenuButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .frame(maxWidth: .infinity)
+            .background(configuration.isPressed ? Theme.panelStrong : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
 @main
 struct KongApp: App {
+    @NSApplicationDelegateAdaptor(KongApplicationDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
 
     var body: some Scene {
@@ -1210,6 +1671,7 @@ struct KongApp: App {
                 .environmentObject(model)
                 .preferredColorScheme(.light)
                 .frame(minWidth: 1040, minHeight: 680)
+                .onAppear { appDelegate.installStatusBar(for: model) }
         }
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unifiedCompact(showsTitle: false))
@@ -1222,21 +1684,6 @@ struct KongApp: App {
             }
         }
 
-        MenuBarExtra {
-            MenuBarContent()
-                .environmentObject(model)
-                .preferredColorScheme(.light)
-        } label: {
-            HStack(spacing: 3) {
-                Image(nsImage: model.menuBarIcon)
-                Text("↓\(model.menuBarDownloadRateText) ↑\(model.menuBarUploadRateText)")
-                    .font(.system(size: 11, weight: .light, design: .rounded))
-                    .monospacedDigit()
-                    .lineLimit(1)
-                    .fixedSize()
-            }
-        }
-        .menuBarExtraStyle(.window)
     }
 }
 
@@ -1706,8 +2153,8 @@ struct ProxyNodeCard: View {
 
 struct ConnectionsView: View {
     @EnvironmentObject var model: AppModel
-    @State private var query = ""
-    @State private var onlyActive = true
+    @StoredState private var query = ""
+    @StoredState private var onlyActive = true
     var items: [ConnectionItem] { model.connections.filter { (!onlyActive || $0.status == .active) && (query.isEmpty || $0.host.localizedCaseInsensitiveContains(query) || $0.app.localizedCaseInsensitiveContains(query)) } }
     var body: some View {
         VStack(spacing: 0) {
@@ -1755,7 +2202,7 @@ struct MetricCard: View {
 
 struct RulesView: View {
     @EnvironmentObject var model: AppModel
-    @State private var query = ""
+    @StoredState private var query = ""
     private var filteredRules: [RuleItem] {
         model.rules.filter {
             query.isEmpty ||
@@ -1848,13 +2295,13 @@ struct ProfileSettingsSheet: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.dismiss) var dismiss
     let profile: Profile
-    @State private var intervalHours: Int
-    @State private var userAgent: String
+    @StoredState private var intervalHours: Int
+    @StoredState private var userAgent: String
 
     init(profile: Profile) {
         self.profile = profile
-        _intervalHours = State(initialValue: 24)
-        _userAgent = State(initialValue: "")
+        _intervalHours = StoredState(initialValue: 24)
+        _userAgent = StoredState(initialValue: "")
     }
 
     var body: some View {
@@ -2041,7 +2488,7 @@ struct InfoTile: View {
 struct ImportProfileSheet: View {
     @EnvironmentObject var model: AppModel
     @Environment(\.dismiss) var dismiss
-    @State private var url = ""
+    @StoredState private var url = ""
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack { ZStack { RoundedRectangle(cornerRadius: 10).fill(Theme.accent.opacity(0.14)); Image(systemName: "link").foregroundStyle(Theme.accent) }.frame(width: 42, height: 42); VStack(alignment: .leading, spacing: 2) { Text("导入配置").font(.system(size: 18, weight: .bold)); Text("添加订阅链接或选择本地文件").font(.system(size: 11)).foregroundStyle(Theme.secondary) } }
@@ -2065,7 +2512,7 @@ struct ImportProfileSheet: View {
 
 struct LogsView: View {
     @EnvironmentObject var model: AppModel
-    @State private var level = "全部"
+    @StoredState private var level = "全部"
     var body: some View {
         VStack(spacing: 0) {
             PageHeader(title: "日志", subtitle: "实时查看内核运行信息") {
@@ -2196,7 +2643,7 @@ struct SettingsView: View {
                                 .font(.system(size: 9)).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)
                         }.padding(.vertical, 12)
                     }
-                    Text("Kong 1.3.13 (Build 153) · Made for macOS").font(.system(size: 10)).foregroundStyle(Theme.secondary).padding(.top, 4)
+                    Text("Kong 1.3.15 (Build 155) · Made for macOS").font(.system(size: 10)).foregroundStyle(Theme.secondary).padding(.top, 4)
                 }.padding(.horizontal, 30).padding(.bottom, 30)
             }
         }
@@ -2297,9 +2744,9 @@ struct RuleProviderEditor: View {
 struct RuleComposer: View {
     @Binding var rules: String
     let policies: [String]
-    @State private var type = "DOMAIN-SUFFIX"
-    @State private var payload = ""
-    @State private var policy = "节点选择"
+    @StoredState private var type = "DOMAIN-SUFFIX"
+    @StoredState private var payload = ""
+    @StoredState private var policy = "节点选择"
 
     private let types = ["DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "GEOSITE", "GEOIP", "IP-CIDR", "PROCESS-NAME", "AND", "OR", "NOT"]
 
@@ -2405,7 +2852,7 @@ struct PortBadge: View {
 
 struct CommandPalette: View {
     @EnvironmentObject var model: AppModel
-    @State private var query = ""
+    @StoredState private var query = ""
     let commands: [(String, String, SidebarSection?)] = [
         ("切换系统代理", "power", nil), ("打开代理节点", "point.3.connected.trianglepath.dotted", .proxies), ("查看活动连接", "arrow.triangle.branch", .connections), ("导入新配置", "plus", .profiles), ("打开设置", "gearshape", .settings)
     ]
